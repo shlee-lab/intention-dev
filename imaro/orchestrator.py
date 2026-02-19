@@ -8,7 +8,6 @@ import logging
 from pathlib import Path
 
 from imaro.config import IMAROConfig
-from imaro.execution.claude_code import ClaudeCodeExecutor
 from imaro.execution.context_manager import ContextManager
 from imaro.intention.document import IntentionDocumentManager
 from imaro.intention.refiner import IntentionRefiner
@@ -51,9 +50,7 @@ class Orchestrator:
         self.plan_generator = PlanGenerator()
         self.consensus_evaluator = ConsensusEvaluator()
         self.milestone_generator = MilestoneGenerator()
-        self.executor = ClaudeCodeExecutor(
-            allowed_tools=self.config.claude_code_allowed_tools,
-        )
+        self.executor = self.config.get_executor()
         self.context_manager = ContextManager()
         self.reviewer = Reviewer()
         self.review_gate = ReviewGate()
@@ -152,7 +149,8 @@ class Orchestrator:
                     completed_results, intention, project_path
                 )
 
-            self.context_manager.restore_context(project_path)
+            if self.config.executor_type == "claude":
+                self.context_manager.restore_context(project_path)
             result.success = True
             self.ui.show_success("All milestones completed successfully!")
 
@@ -277,10 +275,11 @@ class Orchestrator:
             milestone=milestone, status=MilestoneStatus.EXECUTING
         )
 
-        # Write CLAUDE.md context
-        self.context_manager.write_context(
-            milestone, intention, project_path, previous
-        )
+        # Write CLAUDE.md context (only needed for Claude CLI executor)
+        if self.config.executor_type == "claude":
+            self.context_manager.write_context(
+                milestone, intention, project_path, previous
+            )
 
         # Execute
         exec_result = await self.executor.execute_milestone(

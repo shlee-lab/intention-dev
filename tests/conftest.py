@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from imaro.config import IMAROConfig
+from imaro.execution.claude_code import ClaudeCodeExecutor
 from imaro.models.schemas import (
     ConsensusResult,
     IntentionDocument,
@@ -179,6 +180,10 @@ def mock_config(mock_provider):
     config.claude_code_allowed_tools = [
         "Read", "Write", "Edit", "Bash", "Glob", "Grep",
     ]
+    config.executor_type = "claude"
+    config.get_executor.return_value = ClaudeCodeExecutor(
+        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
+    )
     return config
 
 

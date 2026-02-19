@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
-from imaro.config import IMAROConfig
+from imaro.config import IMAROConfig, ProviderConfig
 from imaro.providers.claude_api import ClaudeAPIProvider
 
 
@@ -25,6 +25,7 @@ class TestIMAROConfig:
         assert cfg.execution_timeout_high == 1200
         assert "Read" in cfg.claude_code_allowed_tools
         assert "Write" in cfg.claude_code_allowed_tools
+        assert cfg.executor_type == "gemini"
 
     def test_default_provider_roles(self):
         cfg = IMAROConfig()
@@ -32,6 +33,7 @@ class TestIMAROConfig:
             "refiner", "planner", "consensus",
             "milestone_generator", "reviewer",
             "contradiction_detector", "drift_detector",
+            "executor",
         ]
         for role in expected_roles:
             assert role in cfg.providers
@@ -42,9 +44,24 @@ class TestIMAROConfig:
             provider = cfg.get_provider("refiner")
         assert isinstance(provider, ClaudeAPIProvider)
 
-    def test_get_provider_unknown_type_raises(self):
-        from imaro.config import ProviderConfig
+    def test_get_provider_gemini_type(self):
+        from imaro.providers.gemini_api import GeminiAPIProvider
 
+        cfg = IMAROConfig(
+            providers={
+                "test": ProviderConfig(
+                    type="gemini",
+                    api_key_env="GOOGLE_API_KEY",
+                    model="gemini-2.5-flash",
+                )
+            }
+        )
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}):
+            provider = cfg.get_provider("test")
+        assert isinstance(provider, GeminiAPIProvider)
+        assert provider.get_model_name() == "gemini-2.5-flash"
+
+    def test_get_provider_unknown_type_raises(self):
         cfg = IMAROConfig(
             providers={"custom": ProviderConfig(type="unknown_provider")}
         )
@@ -82,3 +99,34 @@ class TestIMAROConfig:
         assert cfg.get_execution_timeout("low") == 100
         assert cfg.get_execution_timeout("medium") == 200
         assert cfg.get_execution_timeout("high") == 400
+
+
+class TestGetExecutor:
+    def test_get_executor_claude(self):
+        from imaro.execution.claude_code import ClaudeCodeExecutor
+
+        cfg = IMAROConfig(executor_type="claude")
+        executor = cfg.get_executor()
+        assert isinstance(executor, ClaudeCodeExecutor)
+
+    def test_get_executor_gemini(self):
+        from imaro.execution.gemini_executor import GeminiExecutor
+
+        cfg = IMAROConfig(
+            executor_type="gemini",
+            providers={
+                "executor": ProviderConfig(
+                    type="gemini",
+                    api_key_env="GOOGLE_API_KEY",
+                    model="gemini-2.5-flash",
+                ),
+            },
+        )
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}):
+            executor = cfg.get_executor()
+        assert isinstance(executor, GeminiExecutor)
+
+    def test_get_executor_unknown_type_raises(self):
+        cfg = IMAROConfig(executor_type="unknown")
+        with pytest.raises(ValueError, match="Unknown executor type"):
+            cfg.get_executor()
