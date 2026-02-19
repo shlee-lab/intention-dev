@@ -115,7 +115,8 @@ class Orchestrator:
             self.ui.show_progress("Milestone Generation")
             ms_provider = self.config.get_provider("milestone_generator")
             milestones = await self.milestone_generator.generate(
-                plans, consensus, intention, ms_provider
+                plans, consensus, intention, ms_provider,
+                max_milestones=self.config.max_milestones,
             )
             result.milestones = milestones
             self._save_state(

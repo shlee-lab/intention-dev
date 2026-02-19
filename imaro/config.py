@@ -50,6 +50,7 @@ class IMAROConfig(BaseModel):
     max_retries: int = 3
     plan_agents: int = 3
     max_fix_attempts: int = 3
+    max_milestones: int = 10
 
     # Timeouts (seconds)
     execution_timeout_low: int = 300      # 5 min

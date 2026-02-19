@@ -176,6 +176,7 @@ def mock_config(mock_provider):
     config.max_refinement_rounds = 3
     config.max_retries = 3
     config.max_fix_attempts = 3
+    config.max_milestones = 10
     config.drift_alert_threshold = 0.4
     config.claude_code_allowed_tools = [
         "Read", "Write", "Edit", "Bash", "Glob", "Grep",

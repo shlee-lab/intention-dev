@@ -78,7 +78,13 @@ Create a detailed implementation plan for this project. Return ONLY a JSON objec
 }}
 
 Ensure every functional requirement and success criterion from the intention is \
-addressed by at least one milestone.\
+addressed by at least one milestone.
+
+Milestone granularity rules:
+- Group related features into a single milestone (e.g. CRUD operations = 1 milestone, \
+not 4 separate ones).
+- Each milestone must deliver a meaningful, independently testable unit of functionality.
+- Prefer fewer, larger milestones over many small ones.\
 """
 
 

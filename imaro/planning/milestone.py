@@ -77,6 +77,7 @@ class MilestoneGenerator:
         consensus: ConsensusResult,
         intention: IntentionDocument,
         provider: LLMProvider,
+        max_milestones: int = 10,
     ) -> list[Milestone]:
         intention_ctx = IntentionDocumentManager.to_prompt_context(intention)
 
@@ -102,6 +103,28 @@ class MilestoneGenerator:
             plans_json="\n\n".join(plans_text),
         )
 
+        milestones = await self._generate_and_parse(provider, prompt)
+
+        # If over limit, ask LLM to consolidate
+        if len(milestones) > max_milestones:
+            logger.info(
+                "Generated %d milestones, exceeds max %d — requesting consolidation",
+                len(milestones), max_milestones,
+            )
+            milestones = await self._consolidate(
+                provider, milestones, max_milestones, intention_ctx
+            )
+
+        gaps = self.validate_coverage(milestones, intention)
+        if gaps:
+            logger.warning("Unmapped intention items: %s", gaps)
+
+        return milestones
+
+    async def _generate_and_parse(
+        self, provider: LLMProvider, prompt: str
+    ) -> list[Milestone]:
+        """Call LLM, parse JSON, return milestones."""
         resp = await provider.generate(prompt, temperature=0.4, max_tokens=8192)
         try:
             data = extract_json(resp.content)
@@ -116,13 +139,29 @@ class MilestoneGenerator:
             data = extract_json(resp.content)
 
         milestones_data = data.get("milestones", data) if isinstance(data, dict) else data
-        milestones = [Milestone.model_validate(m) for m in milestones_data]
+        return [Milestone.model_validate(m) for m in milestones_data]
 
-        gaps = self.validate_coverage(milestones, intention)
-        if gaps:
-            logger.warning("Unmapped intention items: %s", gaps)
-
-        return milestones
+    async def _consolidate(
+        self,
+        provider: LLMProvider,
+        milestones: list[Milestone],
+        max_milestones: int,
+        intention_ctx: str,
+    ) -> list[Milestone]:
+        """Ask LLM to merge milestones down to the limit."""
+        ms_text = "\n".join(
+            f"  {m.id}: {m.name} — {m.description}" for m in milestones
+        )
+        prompt = (
+            f"You produced {len(milestones)} milestones but the maximum allowed "
+            f"is {max_milestones}.\n\n"
+            f"## Current Milestones\n{ms_text}\n\n"
+            f"## Project Intention\n{intention_ctx}\n\n"
+            f"Merge related milestones to produce at most {max_milestones} milestones. "
+            "Keep the same JSON format. Ensure all requirements remain covered.\n\n"
+            "Respond with ONLY a JSON object: {\"milestones\": [...]}"
+        )
+        return await self._generate_and_parse(provider, prompt)
 
     @staticmethod
     def validate_coverage(
