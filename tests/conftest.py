@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from imaro.config import IMAROConfig
 from imaro.models.schemas import (
     ConsensusResult,
     IntentionDocument,
@@ -13,8 +14,11 @@ from imaro.models.schemas import (
     LLMResponse,
     Milestone,
     Plan,
+    UserReviewDecision,
 )
+from imaro.orchestrator import Orchestrator
 from imaro.providers.base import LLMProvider
+from imaro.ui.terminal import TerminalUI
 
 
 @pytest.fixture
@@ -130,3 +134,55 @@ def tmp_project(tmp_path):
     imaro_dir = tmp_path / ".imaro"
     imaro_dir.mkdir()
     return tmp_path
+
+
+# ── Integration-test fixtures ────────────────────────────────────────────────
+
+
+@pytest.fixture
+def mock_ui():
+    """MagicMock of TerminalUI with all interactive methods pre-configured."""
+    ui = MagicMock(spec=TerminalUI)
+
+    # Approval gates
+    ui.confirm_intention.return_value = True
+    ui.confirm_milestones.return_value = True
+    ui.present_review_report.return_value = UserReviewDecision.APPROVE
+
+    # Refinement helpers
+    ui.ask_refinement_questions.return_value = ["answer1"]
+    ui.ask_skip_refinement.return_value = False
+
+    # Display / no-op methods
+    ui.show_progress.return_value = None
+    ui.show_success.return_value = None
+    ui.show_error.return_value = None
+    ui.show_warning.return_value = None
+    ui.display_intention.return_value = None
+    ui.display_consensus.return_value = None
+    ui.display_milestones.return_value = None
+
+    return ui
+
+
+@pytest.fixture
+def mock_config(mock_provider):
+    """IMAROConfig with get_provider patched to return mock_provider."""
+    config = MagicMock(spec=IMAROConfig)
+    config.get_provider.return_value = mock_provider
+    config.plan_agents = 3
+    config.consensus_threshold = 0.75
+    config.max_refinement_rounds = 3
+    config.max_retries = 3
+    config.max_fix_attempts = 3
+    config.drift_alert_threshold = 0.4
+    config.claude_code_allowed_tools = [
+        "Read", "Write", "Edit", "Bash", "Glob", "Grep",
+    ]
+    return config
+
+
+@pytest.fixture
+def orchestrator(mock_config, mock_ui):
+    """Orchestrator wired with mock config and mock UI."""
+    return Orchestrator(config=mock_config, ui=mock_ui)
