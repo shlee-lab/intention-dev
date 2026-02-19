@@ -40,6 +40,13 @@ Merge the best elements from all plans into a unified milestone sequence. \
 Prioritize aligned points and resolve divergent points by choosing the approach \
 that best serves the project intention.
 
+Milestone design rules:
+- Each milestone must deliver working, testable functionality — NOT just scaffolding.
+- Do NOT create separate milestones for testing, error handling, robustness, \
+or documentation. Include these as part of the implementation milestones.
+- Group closely related features into a single milestone (e.g. CRUD operations = 1 milestone).
+- Prefer fewer, larger milestones over many small ones.
+
 IMPORTANT: Every functional requirement and success criterion from the intention \
 MUST be mapped to at least one milestone's intention_mapping.
 

@@ -35,6 +35,12 @@ def start(
     max_refinement_rounds: int = typer.Option(
         3, "--max-refinement-rounds", help="Max refinement Q&A rounds"
     ),
+    executor: str = typer.Option(
+        "claude", "--executor", "-e", help="Executor type: claude (CLI) or gemini (API)"
+    ),
+    no_interactive: bool = typer.Option(
+        False, "--no-interactive", help="Run without user prompts (auto-approve all)"
+    ),
     verbose: bool = typer.Option(
         False, "--verbose", "-v", help="Enable debug logging"
     ),
@@ -52,9 +58,10 @@ def start(
         plan_agents=plan_agents,
         consensus_threshold=consensus_threshold,
         max_refinement_rounds=max_refinement_rounds,
+        executor_type=executor,
     )
 
-    orchestrator = Orchestrator(config=config)
+    orchestrator = Orchestrator(config=config, interactive=not no_interactive)
     result = asyncio.run(orchestrator.run(description, project_path))
 
     if result.success:

@@ -15,6 +15,7 @@ from imaro.execution.gemini_executor import (
     GeminiExecutor,
     _SMALL_PROJECT_THRESHOLD,
     _SOURCE_EXTENSIONS,
+    _extract_json,
 )
 from imaro.models.schemas import ExecutionResult, LLMResponse
 
@@ -449,3 +450,179 @@ class TestGeminiExecutorBuildPrompt:
 
         assert "Existing Project Files" not in prompt
         assert "Implement this milestone now" in prompt
+
+
+# ── _extract_json ──────────────────────────────────────────────────────────
+
+
+class TestExtractJson:
+    def test_plain_json(self):
+        data = _extract_json('{"files": [], "summary": "ok"}')
+        assert data == {"files": [], "summary": "ok"}
+
+    def test_json_with_markdown_fences(self):
+        text = '```json\n{"files": [], "summary": "ok"}\n```'
+        data = _extract_json(text)
+        assert data["summary"] == "ok"
+
+    def test_json_with_surrounding_text(self):
+        text = 'Here is the JSON:\n{"files": [], "summary": "done"}\nEnd.'
+        data = _extract_json(text)
+        assert data["summary"] == "done"
+
+    def test_nested_braces_in_content(self):
+        """JSON with code content containing braces."""
+        inner = {
+            "files": [
+                {
+                    "path": "main.py",
+                    "action": "create",
+                    "content": "if x:\\n    d = {1: 2}\\nprint(d)",
+                }
+            ],
+            "summary": "created main.py",
+        }
+        text = json.dumps(inner)
+        data = _extract_json(text)
+        assert data["summary"] == "created main.py"
+        assert len(data["files"]) == 1
+
+    def test_balanced_brace_extraction(self):
+        """Text before and after JSON — balanced brace matching should work."""
+        inner = {"files": [], "summary": "test"}
+        text = f"Some preamble text.\n{json.dumps(inner)}\nSome trailing text."
+        data = _extract_json(text)
+        assert data == inner
+
+    def test_raises_on_no_json(self):
+        with pytest.raises(ValueError, match="No valid JSON"):
+            _extract_json("This is just plain text with no JSON at all.")
+
+
+# ── GeminiExecutor — JSON Repair Retry ────────────────────────────────────
+
+
+class TestGeminiExecutorJsonRepair:
+    @pytest.mark.asyncio
+    async def test_retry_on_json_parse_failure(
+        self, tmp_path, sample_milestone, sample_intention
+    ):
+        """When initial response isn't valid JSON, executor retries with repair prompt."""
+        bad_response = "Here is the code:\n```python\nprint('hello')\n```"
+        good_response = json.dumps({
+            "files": [
+                {"path": "main.py", "action": "create", "content": "print('hello')"}
+            ],
+            "summary": "Created main.py",
+        })
+
+        mock_provider = AsyncMock()
+        mock_provider.generate = AsyncMock(
+            side_effect=[
+                # First call: bad response
+                LLMResponse(
+                    content=bad_response,
+                    model="gemini-2.5-flash",
+                    usage={"input_tokens": 100, "output_tokens": 50},
+                ),
+                # Second call (repair): good response
+                LLMResponse(
+                    content=good_response,
+                    model="gemini-2.5-flash",
+                    usage={"input_tokens": 200, "output_tokens": 100},
+                ),
+            ]
+        )
+
+        executor = GeminiExecutor(provider=mock_provider)
+        result = await executor.execute_milestone(
+            sample_milestone, sample_intention, tmp_path
+        )
+
+        assert result.success is True
+        assert "main.py" in result.output
+        # Should have called generate twice (original + repair)
+        assert mock_provider.generate.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_json_valid(
+        self, tmp_path, sample_milestone, sample_intention
+    ):
+        """No repair call when initial response is valid JSON."""
+        good_response = json.dumps({
+            "files": [
+                {"path": "app.py", "action": "create", "content": "x = 1"}
+            ],
+            "summary": "Done",
+        })
+
+        mock_provider = AsyncMock()
+        mock_provider.generate.return_value = LLMResponse(
+            content=good_response,
+            model="gemini-2.5-flash",
+            usage={"input_tokens": 100, "output_tokens": 50},
+        )
+
+        executor = GeminiExecutor(provider=mock_provider)
+        result = await executor.execute_milestone(
+            sample_milestone, sample_intention, tmp_path
+        )
+
+        assert result.success is True
+        # Only one call (no repair needed)
+        assert mock_provider.generate.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_per_file_fallback_on_double_failure(
+        self, tmp_path, sample_milestone, sample_intention
+    ):
+        """When both initial parse and repair fail, falls back to per-file generation."""
+        bad_response = "Here is the code:\n```python\nprint('hello')\n```"
+        file_list_response = json.dumps({
+            "files": [
+                {"path": "main.py", "action": "create"},
+                {"path": "utils.py", "action": "create"},
+            ]
+        })
+
+        call_count = 0
+
+        async def mock_generate(prompt, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count <= 2:
+                # First two calls: bad responses (initial + repair)
+                return LLMResponse(
+                    content=bad_response,
+                    model="gemini-2.5-flash",
+                    usage={"input_tokens": 100, "output_tokens": 50},
+                )
+            elif call_count == 3:
+                # Third call: file list
+                return LLMResponse(
+                    content=file_list_response,
+                    model="gemini-2.5-flash",
+                    usage={"input_tokens": 50, "output_tokens": 30},
+                )
+            else:
+                # Subsequent calls: individual file contents
+                return LLMResponse(
+                    content=f"# file generated for call {call_count}",
+                    model="gemini-2.5-flash",
+                    usage={"input_tokens": 100, "output_tokens": 50},
+                )
+
+        mock_provider = AsyncMock()
+        mock_provider.generate = AsyncMock(side_effect=mock_generate)
+
+        executor = GeminiExecutor(provider=mock_provider)
+        result = await executor.execute_milestone(
+            sample_milestone, sample_intention, tmp_path
+        )
+
+        assert result.success is True
+        assert "Per-file fallback" in result.output
+        assert (tmp_path / "main.py").exists()
+        assert (tmp_path / "utils.py").exists()
+        # 2 (bad) + 1 (file list) + 2 (individual files) = 5 calls
+        assert call_count == 5

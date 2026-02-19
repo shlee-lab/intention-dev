@@ -17,9 +17,9 @@ if TYPE_CHECKING:
 class ProviderConfig(BaseModel):
     """Configuration for a single LLM provider."""
 
-    type: str = "claude"  # claude | gemini
-    api_key_env: str = "ANTHROPIC_API_KEY"
-    model: str = "claude-sonnet-4-20250514"
+    type: str = "gemini"  # claude | gemini
+    api_key_env: str = "GOOGLE_API_KEY"
+    model: str = "gemini-2.5-flash"
 
 
 class IMAROConfig(BaseModel):
@@ -38,7 +38,7 @@ class IMAROConfig(BaseModel):
     })
 
     # Executor type: "claude" (uses claude CLI) or "gemini" (uses Gemini API)
-    executor_type: str = "gemini"
+    executor_type: str = "claude"
 
     # Thresholds
     consensus_threshold: float = 0.75
@@ -50,7 +50,7 @@ class IMAROConfig(BaseModel):
     max_retries: int = 3
     plan_agents: int = 3
     max_fix_attempts: int = 3
-    max_milestones: int = 10
+    max_milestones: int = 5
 
     # Timeouts (seconds)
     execution_timeout_low: int = 300      # 5 min

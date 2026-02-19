@@ -42,6 +42,55 @@ existing code that should be preserved
 - Create all necessary directories implicitly
 - Follow the acceptance criteria and constraints exactly
 - Write production-quality code with proper error handling
+- CRITICAL: Your entire response must be a single valid JSON object. \
+Do not wrap it in markdown code fences. Do not add any text before or after the JSON.
+"""
+
+_JSON_REPAIR_PROMPT = """\
+Your previous response was not valid JSON. I need you to reformat it.
+
+Take the implementation you just described and output it as a SINGLE valid JSON object \
+with this exact structure — nothing else:
+
+{{
+  "files": [
+    {{"path": "relative/path/to/file.py", "action": "create", "content": "..."}},
+    {{"path": "relative/path/to/file.py", "action": "edit", "content": "..."}}
+  ],
+  "summary": "Brief description of what was implemented"
+}}
+
+CRITICAL RULES:
+- Output ONLY the JSON object — no markdown fences, no text before/after
+- All string values must be properly JSON-escaped (newlines as \\n, quotes as \\", etc.)
+- "content" must contain COMPLETE file contents
+
+Here is the beginning of your previous response for reference:
+{previous_response_preview}
+"""
+
+_FILE_LIST_PROMPT = """\
+You are implementing a milestone for a project. List ONLY the files you need to \
+create or modify. Do NOT generate any code yet.
+
+{context}
+
+Respond with ONLY a JSON object (no markdown fences):
+{{"files": [{{"path": "relative/path/to/file.py", "action": "create"}}, ...]}}
+"""
+
+_SINGLE_FILE_PROMPT = """\
+Generate the COMPLETE contents for this single file. Output ONLY the raw file \
+contents — no JSON wrapping, no markdown fences, no explanation.
+
+File: {file_path}
+Action: {action}
+
+{context}
+
+{existing_content}
+
+Output the complete file contents now — nothing else:\
 """
 
 # Extensions to include when scanning existing project files
@@ -112,7 +161,7 @@ class GeminiExecutor(Executor):
                 prompt,
                 system=SYSTEM_PROMPT,
                 temperature=0.3,
-                max_tokens=16384,
+                max_tokens=65536,
             )
         except Exception as exc:
             logger.error("Gemini execution failed: %s", exc)
@@ -127,7 +176,24 @@ class GeminiExecutor(Executor):
             {"role": "assistant", "content": response.content}
         )
 
-        return self._apply_response(response.content, project_path, session_id)
+        logger.debug("Gemini execution response (first 1000 chars): %.1000s", response.content)
+        result = self._apply_response(response.content, project_path, session_id)
+
+        # If JSON parsing failed, attempt a repair pass
+        if not result.success and "Could not parse JSON" in (result.error or ""):
+            logger.warning("JSON parse failed, attempting repair pass")
+            result = await self._retry_json_repair(
+                response.content, project_path, session_id
+            )
+
+        # If repair also failed, fall back to per-file generation
+        if not result.success and "Could not parse JSON" in (result.error or ""):
+            logger.warning("JSON repair also failed, falling back to per-file generation")
+            result = await self._execute_per_file(
+                milestone, context, project_path, session_id
+            )
+
+        return result
 
     async def fix_issues(
         self,
@@ -165,7 +231,7 @@ class GeminiExecutor(Executor):
                 prompt,
                 system=SYSTEM_PROMPT,
                 temperature=0.3,
-                max_tokens=16384,
+                max_tokens=65536,
             )
         except Exception as exc:
             logger.error("Gemini fix failed: %s", exc)
@@ -179,7 +245,18 @@ class GeminiExecutor(Executor):
             {"role": "assistant", "content": response.content}
         )
 
-        return self._apply_response(response.content, project_path, session_id)
+        result = self._apply_response(response.content, project_path, session_id)
+
+        # If JSON parsing failed, attempt a repair pass
+        if not result.success and "Could not parse JSON" in (result.error or ""):
+            logger.warning("JSON parse failed in fix_issues, attempting repair pass")
+            result = await self._retry_json_repair(
+                response.content, project_path, session_id
+            )
+
+        # No per-file fallback for fix_issues — the repair is the last attempt
+
+        return result
 
     async def get_diff(self, project_path: Path) -> str:
         # Try diff against previous commit first (works after orchestrator commits)
@@ -236,6 +313,158 @@ class GeminiExecutor(Executor):
                 except Exception:
                     logger.warning("Could not read %s", filepath)
         return artifacts
+
+    async def _retry_json_repair(
+        self, broken_response: str, project_path: Path, session_id: str
+    ) -> ExecutionResult:
+        """Re-prompt the LLM to output valid JSON when initial parse fails."""
+        # Show a preview of the broken response (first 3000 chars)
+        preview = broken_response[:3000]
+        if len(broken_response) > 3000:
+            preview += f"\n... (truncated, total length: {len(broken_response)})"
+
+        prompt = _JSON_REPAIR_PROMPT.format(previous_response_preview=preview)
+
+        try:
+            response = await self._provider.generate(
+                prompt,
+                system=SYSTEM_PROMPT,
+                temperature=0.1,
+                max_tokens=65536,
+            )
+        except Exception as exc:
+            logger.error("JSON repair LLM call failed: %s", exc)
+            return ExecutionResult(
+                success=False,
+                error=f"JSON repair failed: {exc}",
+                session_id=session_id,
+            )
+
+        logger.debug("JSON repair response (first 1000 chars): %.1000s", response.content)
+        return self._apply_response(response.content, project_path, session_id)
+
+    async def _execute_per_file(
+        self,
+        milestone: Milestone,
+        context: str,
+        project_path: Path,
+        session_id: str,
+    ) -> ExecutionResult:
+        """Fallback: generate files one at a time to avoid large JSON responses."""
+        # Step 1: Ask LLM for the list of files to create/modify
+        milestone_ctx = (
+            f"## Milestone: {milestone.name}\n"
+            f"Description: {milestone.description}\n"
+            f"Scope:\n" + "\n".join(f"  - {s}" for s in milestone.scope) + "\n"
+            f"Acceptance Criteria:\n"
+            + "\n".join(f"  - {c}" for c in milestone.acceptance_criteria)
+        )
+        full_context = f"## Project Context\n{context}\n\n{milestone_ctx}"
+
+        list_prompt = _FILE_LIST_PROMPT.format(context=full_context)
+
+        try:
+            resp = await self._provider.generate(
+                list_prompt, temperature=0.2, max_tokens=4096
+            )
+            data = _extract_json(resp.content)
+            file_list = data.get("files", [])
+        except Exception as exc:
+            logger.error("Per-file fallback: file list generation failed: %s", exc)
+            return ExecutionResult(
+                success=False,
+                error=f"Per-file fallback failed at file listing: {exc}",
+                session_id=session_id,
+            )
+
+        if not file_list:
+            return ExecutionResult(
+                success=False,
+                error="Per-file fallback: LLM returned empty file list",
+                session_id=session_id,
+            )
+
+        logger.info(
+            "Per-file fallback: generating %d files individually", len(file_list)
+        )
+
+        # Step 2: Generate each file individually
+        applied: list[str] = []
+        for file_entry in file_list:
+            rel_path = file_entry.get("path", "")
+            action = file_entry.get("action", "create")
+            if not rel_path:
+                continue
+
+            # Check if file already exists and include its content as context
+            existing = ""
+            target = project_path / rel_path
+            if target.is_file() and action == "edit":
+                try:
+                    old_content = target.read_text(encoding="utf-8")
+                    existing = (
+                        f"## Current contents of {rel_path}:\n"
+                        f"```\n{old_content}\n```\n"
+                        "Update this file — output the COMPLETE new contents."
+                    )
+                except (UnicodeDecodeError, OSError):
+                    pass
+
+            single_prompt = _SINGLE_FILE_PROMPT.format(
+                file_path=rel_path,
+                action=action,
+                context=full_context,
+                existing_content=existing,
+            )
+
+            try:
+                file_resp = await self._provider.generate(
+                    single_prompt,
+                    system=(
+                        "You are a senior software engineer. Output ONLY the raw "
+                        "file contents. No JSON wrapping, no markdown fences, no "
+                        "explanation text."
+                    ),
+                    temperature=0.3,
+                    max_tokens=32768,
+                )
+            except Exception as exc:
+                logger.error("Per-file fallback: failed to generate %s: %s", rel_path, exc)
+                return ExecutionResult(
+                    success=False,
+                    output="\n".join(applied),
+                    error=f"Per-file fallback: failed to generate {rel_path}: {exc}",
+                    session_id=session_id,
+                )
+
+            file_content = file_resp.content
+
+            # Strip markdown fences if present (LLM sometimes adds them despite instructions)
+            file_content = _strip_markdown_fences(file_content)
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                target.write_text(file_content, encoding="utf-8")
+                applied.append(f"{action}: {rel_path}")
+                logger.debug("Per-file applied %s: %s", action, rel_path)
+            except Exception as exc:
+                logger.error("Per-file fallback: failed to write %s: %s", rel_path, exc)
+                return ExecutionResult(
+                    success=False,
+                    output="\n".join(applied),
+                    error=f"Failed to write {rel_path}: {exc}",
+                    session_id=session_id,
+                )
+
+        output_lines = [
+            f"Per-file fallback: generated {len(applied)} files", "",
+            "Files changed:",
+        ] + applied
+        return ExecutionResult(
+            success=True,
+            output="\n".join(output_lines),
+            session_id=session_id,
+        )
 
     def _apply_response(
         self, content: str, project_path: Path, session_id: str
@@ -424,26 +653,83 @@ def _extract_json(text: str) -> dict:
     except json.JSONDecodeError:
         pass
 
-    # Strip markdown code fences
+    # Strip markdown code fences (handle ```json, ```JSON, ``` etc.)
     if "```" in text:
-        # Find content between first ``` and last ```
-        start = text.index("```")
-        # Skip the opening fence line
-        start = text.index("\n", start) + 1
-        end = text.rindex("```")
-        text = text[start:end].strip()
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
+        # Try all pairs of ``` fences (outermost first)
+        fence_positions = []
+        pos = 0
+        while True:
+            idx = text.find("```", pos)
+            if idx == -1:
+                break
+            fence_positions.append(idx)
+            pos = idx + 3
 
-    # Try to find JSON object boundaries
+        # Try outermost pair
+        if len(fence_positions) >= 2:
+            start = fence_positions[0]
+            # Skip the opening fence line (```json etc.)
+            newline = text.find("\n", start)
+            if newline != -1:
+                inner_start = newline + 1
+                inner_end = fence_positions[-1]
+                candidate = text[inner_start:inner_end].strip()
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+
+    # Try balanced brace matching from first { to find the complete JSON object
+    brace_start = text.find("{")
+    if brace_start != -1:
+        depth = 0
+        in_string = False
+        escape_next = False
+        for i in range(brace_start, len(text)):
+            ch = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\":
+                if in_string:
+                    escape_next = True
+                continue
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[brace_start : i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break  # balanced but not valid JSON
+
+    # Fallback: simple first-{ to last-} (less precise but catches more cases)
     brace_start = text.find("{")
     brace_end = text.rfind("}")
-    if brace_start != -1 and brace_end != -1:
+    if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
         try:
             return json.loads(text[brace_start : brace_end + 1])
         except json.JSONDecodeError:
             pass
 
     raise ValueError(f"No valid JSON found in response (length={len(text)})")
+
+
+def _strip_markdown_fences(text: str) -> str:
+    """Remove surrounding markdown code fences from raw file content."""
+    text = text.strip()
+    if text.startswith("```"):
+        # Remove opening fence line
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1:]
+    if text.endswith("```"):
+        text = text[: -3]
+    return text.strip()

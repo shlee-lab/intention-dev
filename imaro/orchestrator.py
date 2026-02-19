@@ -13,6 +13,7 @@ from imaro.execution.context_manager import ContextManager
 from imaro.intention.document import IntentionDocumentManager
 from imaro.intention.refiner import IntentionRefiner
 from imaro.models.usage import TrackedProvider, UsageTracker
+from imaro.providers.base import LLMProvider
 from imaro.models.schemas import (
     DriftReport,
     IntentionDocument,
@@ -43,19 +44,12 @@ class Orchestrator:
         self,
         config: IMAROConfig | None = None,
         ui: TerminalUI | None = None,
+        interactive: bool = True,
     ) -> None:
         self.config = config or IMAROConfig()
         self.ui = ui or TerminalUI()
+        self.interactive = interactive
         self.usage_tracker = UsageTracker()
-
-        # Wrap config.get_provider so every provider is tracked automatically
-        _original_get_provider = self.config.get_provider
-
-        def _tracked_get_provider(role: str):
-            provider = _original_get_provider(role)
-            return TrackedProvider(provider, self.usage_tracker, role)
-
-        self.config.get_provider = _tracked_get_provider  # type: ignore[assignment]
 
         self.doc_manager = IntentionDocumentManager()
         self.refiner = IntentionRefiner()
@@ -66,6 +60,11 @@ class Orchestrator:
         self.context_manager = ContextManager()
         self.reviewer = Reviewer()
         self.review_gate = ReviewGate()
+
+    def _get_provider(self, role: str) -> LLMProvider:
+        """Get a provider wrapped with usage tracking."""
+        provider = self.config.get_provider(role)
+        return TrackedProvider(provider, self.usage_tracker, role)
 
     async def run(
         self,
@@ -95,7 +94,7 @@ class Orchestrator:
 
             # ── Phase 3: Consensus Evaluation ───────────────────────────
             self.ui.show_progress("Consensus Evaluation")
-            consensus_provider = self.config.get_provider("consensus")
+            consensus_provider = self._get_provider("consensus")
             consensus = await self.consensus_evaluator.evaluate(
                 plans, intention, consensus_provider, self.config.consensus_threshold
             )
@@ -105,15 +104,21 @@ class Orchestrator:
             self.ui.display_consensus(consensus)
 
             if consensus.recommendation != "proceed":
-                plans, intention = await self._handle_consensus_failure(
-                    consensus, plans, intention, project_path
-                )
-                result.plans = plans
-                result.intention = intention
+                if self.interactive:
+                    plans, intention = await self._handle_consensus_failure(
+                        consensus, plans, intention, project_path
+                    )
+                    result.plans = plans
+                    result.intention = intention
+                else:
+                    self.ui.show_warning(
+                        f"Consensus: {consensus.recommendation} "
+                        f"(score={consensus.overall_score:.2f}) — proceeding anyway"
+                    )
 
             # ── Phase 4: Milestone Generation ───────────────────────────
             self.ui.show_progress("Milestone Generation")
-            ms_provider = self.config.get_provider("milestone_generator")
+            ms_provider = self._get_provider("milestone_generator")
             milestones = await self.milestone_generator.generate(
                 plans, consensus, intention, ms_provider,
                 max_milestones=self.config.max_milestones,
@@ -123,13 +128,18 @@ class Orchestrator:
                 state_dir, "milestones", [m.model_dump() for m in milestones]
             )
 
-            approved = await asyncio.to_thread(
-                self.ui.confirm_milestones, milestones, intention
-            )
-            if not approved:
-                self.ui.show_warning("Milestones not approved. Aborting.")
-                result.error = "Milestones not approved by user"
-                return result
+            if self.interactive:
+                approved = await asyncio.to_thread(
+                    self.ui.confirm_milestones, milestones, intention
+                )
+                if not approved:
+                    self.ui.show_warning("Milestones not approved. Aborting.")
+                    result.error = "Milestones not approved by user"
+                    return result
+            else:
+                self.ui.show_progress(
+                    "Milestones", f"Auto-approved {len(milestones)} milestones"
+                )
 
             # ── Phase 5: Execute & Review Each Milestone ────────────────
             self._ensure_git_repo(project_path)
@@ -203,7 +213,27 @@ class Orchestrator:
     # ── Intention ────────────────────────────────────────────────────────
 
     async def _refine_intention(self, raw_input: str) -> IntentionDocument:
-        provider = self.config.get_provider("refiner")
+        provider = self._get_provider("refiner")
+
+        # Non-interactive: skip Q&A, tell refiner to produce document directly
+        if not self.interactive:
+            self.ui.show_progress("Intention Refinement", "Non-interactive mode — skipping Q&A")
+            result, ready = await self.refiner.refine(
+                raw_input, provider, max_rounds=0
+            )
+            if ready and isinstance(result, IntentionDocument):
+                self.ui.display_intention(result)
+                return result
+            # If questions came back, force a final pass with no answers
+            result, ready = await self.refiner.refine_with_answers(
+                raw_input, [], provider
+            )
+            if ready and isinstance(result, IntentionDocument):
+                self.ui.display_intention(result)
+                return result
+            raise RuntimeError("Refiner could not produce document in non-interactive mode")
+
+        # Interactive mode: full Q&A loop
         history: list[RefinementRound] = []
 
         for round_num in range(1, self.config.max_refinement_rounds + 1):
@@ -258,7 +288,7 @@ class Orchestrator:
     # ── Planning ─────────────────────────────────────────────────────────
 
     async def _generate_plans(self, intention: IntentionDocument) -> list[Plan]:
-        provider = self.config.get_provider("planner")
+        provider = self._get_provider("planner")
         return await self.plan_generator.generate_plans(
             intention,
             num_agents=self.config.plan_agents,
@@ -344,7 +374,7 @@ class Orchestrator:
             artifacts = await self.executor.get_changed_artifacts(project_path)
 
             # Run all reviewers in parallel
-            review_provider = self.config.get_provider("reviewer")
+            review_provider = self._get_provider("reviewer")
             review_tasks = [
                 self.reviewer.review(
                     role, milestone, intention, diff, artifacts, review_provider
@@ -364,16 +394,27 @@ class Orchestrator:
             ms_result.reviews = valid_reviews
 
             # Compile report
-            contradiction_provider = self.config.get_provider("contradiction_detector")
+            contradiction_provider = self._get_provider("contradiction_detector")
             report = await self.review_gate.compile_report(
                 valid_reviews, contradiction_provider
             )
             ms_result.review_report = report
 
             # Present to user
-            decision = await asyncio.to_thread(
-                self.ui.present_review_report, milestone, report, intention
-            )
+            if self.interactive:
+                decision = await asyncio.to_thread(
+                    self.ui.present_review_report, milestone, report, intention
+                )
+            else:
+                # Auto-approve if no critical issues, auto-fix otherwise
+                if not report.critical_issues:
+                    decision = UserReviewDecision.APPROVE
+                else:
+                    decision = UserReviewDecision.FIX
+                self.ui.show_progress(
+                    "Review",
+                    f"Auto-{decision.value} ({len(report.critical_issues)} critical issues)",
+                )
 
             if decision == UserReviewDecision.APPROVE:
                 ms_result.status = MilestoneStatus.COMPLETED
@@ -428,7 +469,7 @@ class Orchestrator:
         if len(completed) < 2:
             return  # Skip drift check for first milestone
 
-        provider = self.config.get_provider("drift_detector")
+        provider = self._get_provider("drift_detector")
         intention_ctx = IntentionDocumentManager.to_prompt_context(intention)
 
         milestones_summary = "\n".join(
@@ -458,11 +499,16 @@ class Orchestrator:
             return
 
         if drift.drift_score >= self.config.drift_alert_threshold:
-            choice = await asyncio.to_thread(
-                self.ui.handle_drift, drift, intention
-            )
-            if choice == "abort":
-                raise RuntimeError("User aborted due to drift")
+            if self.interactive:
+                choice = await asyncio.to_thread(
+                    self.ui.handle_drift, drift, intention
+                )
+                if choice == "abort":
+                    raise RuntimeError("User aborted due to drift")
+            else:
+                self.ui.show_warning(
+                    f"Drift detected (score={drift.drift_score:.2f}) — continuing anyway"
+                )
 
     # ── Usage Display ────────────────────────────────────────────────────
 

@@ -25,7 +25,8 @@ class TestIMAROConfig:
         assert cfg.execution_timeout_high == 1200
         assert "Read" in cfg.claude_code_allowed_tools
         assert "Write" in cfg.claude_code_allowed_tools
-        assert cfg.executor_type == "gemini"
+        assert cfg.executor_type == "claude"
+        assert cfg.max_milestones == 5
 
     def test_default_provider_roles(self):
         cfg = IMAROConfig()
@@ -38,11 +39,13 @@ class TestIMAROConfig:
         for role in expected_roles:
             assert role in cfg.providers
 
-    def test_get_provider_returns_claude_api_provider(self):
+    def test_get_provider_returns_gemini_api_provider(self):
+        from imaro.providers.gemini_api import GeminiAPIProvider
+
         cfg = IMAROConfig()
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}):
             provider = cfg.get_provider("refiner")
-        assert isinstance(provider, ClaudeAPIProvider)
+        assert isinstance(provider, GeminiAPIProvider)
 
     def test_get_provider_gemini_type(self):
         from imaro.providers.gemini_api import GeminiAPIProvider
@@ -69,10 +72,12 @@ class TestIMAROConfig:
             cfg.get_provider("custom")
 
     def test_get_provider_missing_role_uses_default(self):
+        from imaro.providers.gemini_api import GeminiAPIProvider
+
         cfg = IMAROConfig()
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
+        with patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}):
             provider = cfg.get_provider("nonexistent_role")
-        assert isinstance(provider, ClaudeAPIProvider)
+        assert isinstance(provider, GeminiAPIProvider)
 
     def test_get_execution_timeout_low(self):
         cfg = IMAROConfig()
@@ -105,7 +110,7 @@ class TestGetExecutor:
     def test_get_executor_claude(self):
         from imaro.execution.claude_code import ClaudeCodeExecutor
 
-        cfg = IMAROConfig(executor_type="claude")
+        cfg = IMAROConfig()  # default is now "claude"
         executor = cfg.get_executor()
         assert isinstance(executor, ClaudeCodeExecutor)
 
