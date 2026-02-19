@@ -35,11 +35,53 @@ Respond with this exact JSON structure:
 
 Rules:
 - "action" must be "create" for new files or "edit" for modifying existing files
-- "content" must contain the complete file contents (not a diff)
+- "content" must contain the COMPLETE file contents (not a diff)
+- For files that already exist, include the COMPLETE updated content — do not omit \
+existing code that should be preserved
 - Use relative paths from the project root
 - Create all necessary directories implicitly
 - Follow the acceptance criteria and constraints exactly
 - Write production-quality code with proper error handling
+"""
+
+# Extensions to include when scanning existing project files
+_SOURCE_EXTENSIONS = frozenset({
+    ".py", ".js", ".ts", ".jsx", ".tsx", ".json", ".toml", ".yaml", ".yml",
+    ".cfg", ".ini", ".md", ".txt", ".html", ".css", ".sh", ".sql",
+})
+
+# Directories to skip when scanning
+_SKIP_DIRS = frozenset({
+    ".git", ".imaro", "__pycache__", "node_modules", ".venv", "venv",
+    ".mypy_cache", ".pytest_cache", ".tox", "dist", "build", "egg-info",
+})
+
+# Max size (bytes) for individual files included as context
+_MAX_FILE_SIZE = 32_768
+
+# Below this file count we include everything (no selection pass needed)
+_SMALL_PROJECT_THRESHOLD = 15
+
+_FILE_SELECTION_PROMPT = """\
+You are a senior software engineer. Given a project file tree and a milestone \
+description, select ONLY the files whose contents are needed to correctly \
+implement the milestone. Include files that will be modified AND files that \
+provide essential context (imports, schemas, configs, etc.).
+
+## Milestone: {milestone_name}
+
+Description: {milestone_description}
+
+Scope:
+{milestone_scope}
+
+## Project File Tree
+{file_tree}
+
+Respond with ONLY a JSON object (no markdown fences):
+{{"files": ["path/to/file1.py", "path/to/file2.py"]}}
+
+Be selective — only include files that are truly necessary.\
 """
 
 
@@ -60,7 +102,7 @@ class GeminiExecutor(Executor):
     ) -> ExecutionResult:
         session_id = session_id or str(uuid.uuid4())
         context = IntentionDocumentManager.to_milestone_context(intention, milestone)
-        prompt = self._build_execution_prompt(milestone, context, project_path)
+        prompt = await self._build_execution_prompt(milestone, context, project_path)
 
         # Store prompt in session history
         self._sessions[session_id] = [{"role": "user", "content": prompt}]
@@ -140,6 +182,18 @@ class GeminiExecutor(Executor):
         return self._apply_response(response.content, project_path, session_id)
 
     async def get_diff(self, project_path: Path) -> str:
+        # Try diff against previous commit first (works after orchestrator commits)
+        proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "HEAD~1",
+            cwd=str(project_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0 and stdout.strip():
+            return stdout.decode()
+
+        # Fallback: diff against working tree (unstaged changes)
         proc = await asyncio.create_subprocess_exec(
             "git", "diff",
             cwd=str(project_path),
@@ -153,15 +207,25 @@ class GeminiExecutor(Executor):
         return stdout.decode()
 
     async def get_changed_artifacts(self, project_path: Path) -> dict[str, str]:
+        # Try diff against previous commit first
         proc = await asyncio.create_subprocess_exec(
-            "git", "diff", "--name-only",
+            "git", "diff", "--name-only", "HEAD~1",
             cwd=str(project_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, _ = await proc.communicate()
-        if proc.returncode != 0:
-            return {}
+        if proc.returncode != 0 or not stdout.strip():
+            # Fallback: unstaged changes
+            proc = await asyncio.create_subprocess_exec(
+                "git", "diff", "--name-only",
+                cwd=str(project_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            if proc.returncode != 0:
+                return {}
 
         artifacts: dict[str, str] = {}
         for line in stdout.decode().strip().splitlines():
@@ -223,9 +287,8 @@ class GeminiExecutor(Executor):
             session_id=session_id,
         )
 
-    @staticmethod
-    def _build_execution_prompt(
-        milestone: Milestone, context: str, project_path: Path
+    async def _build_execution_prompt(
+        self, milestone: Milestone, context: str, project_path: Path
     ) -> str:
         lines = [
             f"## Project Context\n{context}",
@@ -245,6 +308,23 @@ class GeminiExecutor(Executor):
                 ["", "Constraints:", *[f"  - {c}" for c in milestone.constraints]]
             )
 
+        # Include existing source files so the LLM preserves prior work
+        file_tree = self._get_file_tree(project_path)
+        if file_tree:
+            selected = await self._select_relevant_files(
+                file_tree, milestone, project_path
+            )
+            if selected:
+                lines.append("")
+                lines.append("## Existing Project Files")
+                lines.append(
+                    "The following files already exist. When modifying them, "
+                    "include the COMPLETE updated content."
+                )
+                for rel_path, content in selected.items():
+                    lines.append(f"\n### {rel_path}")
+                    lines.append(f"```\n{content}\n```")
+
         lines.extend([
             "",
             f"## Working Directory: {project_path}",
@@ -252,6 +332,87 @@ class GeminiExecutor(Executor):
             "Implement this milestone now. Respond with JSON only.",
         ])
         return "\n".join(lines)
+
+    @staticmethod
+    def _get_file_tree(project_path: Path) -> list[str]:
+        """Return sorted list of relative paths for all source files."""
+        tree: list[str] = []
+        for path in sorted(project_path.rglob("*")):
+            if not path.is_file():
+                continue
+            if any(part in _SKIP_DIRS for part in path.parts):
+                continue
+            if path.suffix not in _SOURCE_EXTENSIONS:
+                continue
+            if path.stat().st_size > _MAX_FILE_SIZE:
+                continue
+            try:
+                tree.append(str(path.relative_to(project_path)))
+            except ValueError:
+                continue
+        return tree
+
+    async def _select_relevant_files(
+        self,
+        file_tree: list[str],
+        milestone: Milestone,
+        project_path: Path,
+    ) -> dict[str, str]:
+        """2-pass file selection: ask LLM which files matter, then read them.
+
+        For small projects (< threshold files), skips the LLM call and
+        includes everything directly.
+        """
+        # Small project — include all files, no selection needed
+        if len(file_tree) <= _SMALL_PROJECT_THRESHOLD:
+            return self._read_files(project_path, file_tree)
+
+        # Pass 1: ask LLM to pick relevant files
+        scope_text = "\n".join(f"  - {s}" for s in milestone.scope)
+        prompt = _FILE_SELECTION_PROMPT.format(
+            milestone_name=milestone.name,
+            milestone_description=milestone.description,
+            milestone_scope=scope_text,
+            file_tree="\n".join(f"  {f}" for f in file_tree),
+        )
+
+        try:
+            resp = await self._provider.generate(
+                prompt, temperature=0.1, max_tokens=2048
+            )
+            data = _extract_json(resp.content)
+            selected_paths = data.get("files", [])
+            # Validate: only accept paths that actually exist in the tree
+            tree_set = set(file_tree)
+            selected_paths = [p for p in selected_paths if p in tree_set]
+        except Exception as exc:
+            logger.warning(
+                "File selection LLM call failed (%s), falling back to all files", exc
+            )
+            selected_paths = file_tree
+
+        if not selected_paths:
+            selected_paths = file_tree
+
+        logger.info(
+            "File selection: %d/%d files selected for milestone %s",
+            len(selected_paths), len(file_tree), milestone.id,
+        )
+        return self._read_files(project_path, selected_paths)
+
+    @staticmethod
+    def _read_files(project_path: Path, rel_paths: list[str]) -> dict[str, str]:
+        """Read file contents for the given relative paths."""
+        files: dict[str, str] = {}
+        for rel in rel_paths:
+            path = project_path / rel
+            if not path.is_file():
+                continue
+            try:
+                files[rel] = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+        return files
 
 
 def _extract_json(text: str) -> dict:

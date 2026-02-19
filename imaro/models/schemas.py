@@ -183,3 +183,4 @@ class ProjectResult(BaseModel):
     milestone_results: list[MilestoneResult] = Field(default_factory=list)
     success: bool = False
     error: str = ""
+    usage_summary: dict[str, Any] = Field(default_factory=dict)

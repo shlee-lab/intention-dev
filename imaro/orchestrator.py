@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import subprocess
 from pathlib import Path
 
 from imaro.config import IMAROConfig
 from imaro.execution.context_manager import ContextManager
 from imaro.intention.document import IntentionDocumentManager
 from imaro.intention.refiner import IntentionRefiner
+from imaro.models.usage import TrackedProvider, UsageTracker
 from imaro.models.schemas import (
     DriftReport,
     IntentionDocument,
@@ -44,6 +46,16 @@ class Orchestrator:
     ) -> None:
         self.config = config or IMAROConfig()
         self.ui = ui or TerminalUI()
+        self.usage_tracker = UsageTracker()
+
+        # Wrap config.get_provider so every provider is tracked automatically
+        _original_get_provider = self.config.get_provider
+
+        def _tracked_get_provider(role: str):
+            provider = _original_get_provider(role)
+            return TrackedProvider(provider, self.usage_tracker, role)
+
+        self.config.get_provider = _tracked_get_provider  # type: ignore[assignment]
 
         self.doc_manager = IntentionDocumentManager()
         self.refiner = IntentionRefiner()
@@ -119,6 +131,8 @@ class Orchestrator:
                 return result
 
             # ── Phase 5: Execute & Review Each Milestone ────────────────
+            self._ensure_git_repo(project_path)
+
             completed_results: list[MilestoneResult] = []
             for milestone in milestones:
                 self.ui.show_progress(
@@ -161,6 +175,26 @@ class Orchestrator:
             logger.exception("Orchestrator error")
             self.ui.show_error(f"Error: {exc}")
             result.error = str(exc)
+        finally:
+            # Always attach and display usage summary
+            summary = self.usage_tracker.summary()
+            result.usage_summary = {
+                "total_input_tokens": summary.total_input_tokens,
+                "total_output_tokens": summary.total_output_tokens,
+                "total_cost": round(summary.total_cost, 4),
+                "total_calls": summary.total_calls,
+                "by_role": [
+                    {
+                        "role": rb.role,
+                        "calls": rb.calls,
+                        "input_tokens": rb.input_tokens,
+                        "output_tokens": rb.output_tokens,
+                        "cost": round(rb.cost, 4),
+                    }
+                    for rb in summary.by_role
+                ],
+            }
+            self._display_usage_summary(summary)
 
         self._save_state(state_dir, "result", result.model_dump())
         return result
@@ -296,6 +330,9 @@ class Orchestrator:
 
         self.ui.show_success(f"Milestone {milestone.id} executed")
 
+        # Commit so reviewers can see a meaningful diff
+        self._commit_milestone(project_path, milestone.id)
+
         # Review loop
         for attempt in range(1, self.config.max_fix_attempts + 1):
             ms_result.status = MilestoneStatus.REVIEWING
@@ -372,6 +409,9 @@ class Orchestrator:
                 ms_result.status = MilestoneStatus.FAILED
                 return ms_result
 
+            # Commit fix so next review cycle sees the diff
+            self._commit_milestone(project_path, f"{milestone.id}-fix{attempt}")
+
         self.ui.show_warning("Max fix attempts reached")
         ms_result.status = MilestoneStatus.COMPLETED
         return ms_result
@@ -422,6 +462,79 @@ class Orchestrator:
             )
             if choice == "abort":
                 raise RuntimeError("User aborted due to drift")
+
+    # ── Usage Display ────────────────────────────────────────────────────
+
+    def _display_usage_summary(self, summary) -> None:
+        """Print a usage/cost summary to the terminal."""
+        if summary.total_calls == 0:
+            return
+        self.ui.show_progress("Usage Summary")
+        for rb in summary.by_role:
+            self.ui.show_progress(
+                f"  {rb.role}",
+                f"{rb.calls} calls | "
+                f"{rb.input_tokens:,} in / {rb.output_tokens:,} out | "
+                f"${rb.cost:.4f}",
+            )
+        self.ui.show_progress(
+            "  Total",
+            f"{summary.total_calls} calls | "
+            f"{summary.total_input_tokens:,} in / {summary.total_output_tokens:,} out | "
+            f"${summary.total_cost:.4f}",
+        )
+
+    # ── Git Helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ensure_git_repo(project_path: Path) -> None:
+        """Initialize a git repo if one doesn't exist at project_path."""
+        git_dir = project_path / ".git"
+        if git_dir.is_dir():
+            return
+        subprocess.run(
+            ["git", "init"],
+            cwd=str(project_path),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=str(project_path),
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "Initial commit (IMARO)", "--allow-empty"],
+            cwd=str(project_path),
+            capture_output=True,
+            check=True,
+        )
+        logger.info("Initialized git repo at %s", project_path)
+
+    @staticmethod
+    def _commit_milestone(project_path: Path, milestone_id: str) -> None:
+        """Stage all changes and commit after a milestone execution."""
+        subprocess.run(
+            ["git", "add", "."],
+            cwd=str(project_path),
+            capture_output=True,
+            check=True,
+        )
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=str(project_path),
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return  # Nothing staged
+        subprocess.run(
+            ["git", "commit", "-m", f"Milestone {milestone_id} completed (IMARO)"],
+            cwd=str(project_path),
+            capture_output=True,
+            check=True,
+        )
+        logger.info("Committed milestone %s", milestone_id)
 
     # ── State Persistence ────────────────────────────────────────────────
 

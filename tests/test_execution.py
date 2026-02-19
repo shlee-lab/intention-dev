@@ -1,4 +1,4 @@
-"""Tests for ClaudeCodeExecutor and ContextManager."""
+"""Tests for ClaudeCodeExecutor, ContextManager, and GeminiExecutor."""
 
 from __future__ import annotations
 
@@ -11,7 +11,12 @@ import pytest
 
 from imaro.execution.claude_code import ClaudeCodeExecutor
 from imaro.execution.context_manager import ContextManager
-from imaro.models.schemas import ExecutionResult
+from imaro.execution.gemini_executor import (
+    GeminiExecutor,
+    _SMALL_PROJECT_THRESHOLD,
+    _SOURCE_EXTENSIONS,
+)
+from imaro.models.schemas import ExecutionResult, LLMResponse
 
 
 # ── ClaudeCodeExecutor ──────────────────────────────────────────────────────
@@ -249,3 +254,198 @@ class TestContextManager:
         """Neither backup nor CLAUDE.md — should not fail."""
         cm = ContextManager()
         cm.restore_context(tmp_project)  # Should not raise
+
+
+# ── GeminiExecutor — File Selection ────────────────────────────────────────
+
+
+class TestGeminiExecutorFileTree:
+    def test_get_file_tree_returns_source_files(self, tmp_path):
+        (tmp_path / "main.py").write_text("print('hi')")
+        (tmp_path / "config.toml").write_text("[tool]")
+        (tmp_path / "image.png").write_bytes(b"\x89PNG")  # not a source ext
+        sub = tmp_path / "src"
+        sub.mkdir()
+        (sub / "app.py").write_text("import os")
+
+        tree = GeminiExecutor._get_file_tree(tmp_path)
+        assert "main.py" in tree
+        assert "config.toml" in tree
+        assert "src/app.py" in tree
+        assert "image.png" not in tree
+
+    def test_get_file_tree_skips_hidden_dirs(self, tmp_path):
+        git_dir = tmp_path / ".git"
+        git_dir.mkdir()
+        (git_dir / "config").write_text("bare = false")
+        pycache = tmp_path / "__pycache__"
+        pycache.mkdir()
+        (pycache / "mod.cpython-312.pyc").write_bytes(b"")
+        (tmp_path / "real.py").write_text("x = 1")
+
+        tree = GeminiExecutor._get_file_tree(tmp_path)
+        assert "real.py" in tree
+        assert not any(".git" in p for p in tree)
+        assert not any("__pycache__" in p for p in tree)
+
+    def test_get_file_tree_empty_project(self, tmp_path):
+        assert GeminiExecutor._get_file_tree(tmp_path) == []
+
+
+class TestGeminiExecutorFileSelection:
+    @pytest.mark.asyncio
+    async def test_small_project_skips_llm_call(self, tmp_path, sample_milestone):
+        """Under threshold — all files included, no LLM call."""
+        for i in range(5):
+            (tmp_path / f"file{i}.py").write_text(f"# file {i}")
+
+        mock_provider = AsyncMock()
+        executor = GeminiExecutor(provider=mock_provider)
+
+        tree = GeminiExecutor._get_file_tree(tmp_path)
+        assert len(tree) <= _SMALL_PROJECT_THRESHOLD
+
+        result = await executor._select_relevant_files(tree, sample_milestone, tmp_path)
+        assert len(result) == 5
+        # Provider should NOT have been called
+        mock_provider.generate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_large_project_calls_llm_for_selection(
+        self, tmp_path, sample_milestone
+    ):
+        """Over threshold — LLM is asked to select files."""
+        for i in range(_SMALL_PROJECT_THRESHOLD + 5):
+            (tmp_path / f"mod_{i}.py").write_text(f"# module {i}")
+
+        # LLM responds with a subset
+        selected = ["mod_0.py", "mod_3.py", "mod_7.py"]
+        mock_provider = AsyncMock()
+        mock_provider.generate.return_value = LLMResponse(
+            content=json.dumps({"files": selected}),
+            model="gemini-2.5-flash",
+            usage={"input_tokens": 100, "output_tokens": 50},
+        )
+
+        executor = GeminiExecutor(provider=mock_provider)
+        tree = GeminiExecutor._get_file_tree(tmp_path)
+
+        result = await executor._select_relevant_files(tree, sample_milestone, tmp_path)
+        assert set(result.keys()) == set(selected)
+        mock_provider.generate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_llm_returns_invalid_paths_ignored(
+        self, tmp_path, sample_milestone
+    ):
+        """Paths not in tree are filtered out."""
+        for i in range(_SMALL_PROJECT_THRESHOLD + 1):
+            (tmp_path / f"f{i}.py").write_text(f"# {i}")
+
+        mock_provider = AsyncMock()
+        mock_provider.generate.return_value = LLMResponse(
+            content=json.dumps({"files": ["f0.py", "nonexistent.py", "f1.py"]}),
+            model="gemini-2.5-flash",
+            usage={"input_tokens": 50, "output_tokens": 30},
+        )
+
+        executor = GeminiExecutor(provider=mock_provider)
+        tree = GeminiExecutor._get_file_tree(tmp_path)
+
+        result = await executor._select_relevant_files(tree, sample_milestone, tmp_path)
+        assert "f0.py" in result
+        assert "f1.py" in result
+        assert "nonexistent.py" not in result
+
+    @pytest.mark.asyncio
+    async def test_llm_failure_falls_back_to_all_files(
+        self, tmp_path, sample_milestone
+    ):
+        """If LLM call fails, all files are included as fallback."""
+        for i in range(_SMALL_PROJECT_THRESHOLD + 1):
+            (tmp_path / f"f{i}.py").write_text(f"# {i}")
+
+        mock_provider = AsyncMock()
+        mock_provider.generate.side_effect = RuntimeError("API down")
+
+        executor = GeminiExecutor(provider=mock_provider)
+        tree = GeminiExecutor._get_file_tree(tmp_path)
+
+        result = await executor._select_relevant_files(tree, sample_milestone, tmp_path)
+        # Should fall back to all files
+        assert len(result) == len(tree)
+
+    @pytest.mark.asyncio
+    async def test_llm_returns_empty_selection_falls_back(
+        self, tmp_path, sample_milestone
+    ):
+        """If LLM returns empty list, fall back to all files."""
+        for i in range(_SMALL_PROJECT_THRESHOLD + 1):
+            (tmp_path / f"f{i}.py").write_text(f"# {i}")
+
+        mock_provider = AsyncMock()
+        mock_provider.generate.return_value = LLMResponse(
+            content=json.dumps({"files": []}),
+            model="gemini-2.5-flash",
+            usage={"input_tokens": 50, "output_tokens": 10},
+        )
+
+        executor = GeminiExecutor(provider=mock_provider)
+        tree = GeminiExecutor._get_file_tree(tmp_path)
+
+        result = await executor._select_relevant_files(tree, sample_milestone, tmp_path)
+        assert len(result) == len(tree)
+
+
+class TestGeminiExecutorBuildPrompt:
+    @pytest.mark.asyncio
+    async def test_prompt_includes_selected_files(
+        self, tmp_path, sample_milestone, sample_intention
+    ):
+        """Build prompt should contain contents of existing files."""
+        (tmp_path / "app.py").write_text("def main(): pass")
+        (tmp_path / "utils.py").write_text("def helper(): pass")
+
+        mock_provider = AsyncMock()
+        mock_provider.generate.return_value = LLMResponse(
+            content="{}",
+            model="mock",
+            usage={"input_tokens": 10, "output_tokens": 10},
+        )
+
+        from imaro.intention.document import IntentionDocumentManager
+
+        executor = GeminiExecutor(provider=mock_provider)
+        context = IntentionDocumentManager.to_milestone_context(
+            sample_intention, sample_milestone
+        )
+
+        prompt = await executor._build_execution_prompt(
+            sample_milestone, context, tmp_path
+        )
+
+        assert "Existing Project Files" in prompt
+        assert "app.py" in prompt
+        assert "def main(): pass" in prompt
+        assert "utils.py" in prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_no_files_no_section(
+        self, tmp_path, sample_milestone, sample_intention
+    ):
+        """Empty project — no 'Existing Project Files' section."""
+        mock_provider = AsyncMock()
+        executor = GeminiExecutor(provider=mock_provider)
+
+        from imaro.intention.document import IntentionDocumentManager
+
+        context = IntentionDocumentManager.to_milestone_context(
+            sample_intention, sample_milestone
+        )
+
+        prompt = await executor._build_execution_prompt(
+            sample_milestone, context, tmp_path
+        )
+
+        assert "Existing Project Files" not in prompt
+        assert "Implement this milestone now" in prompt

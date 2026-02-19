@@ -144,6 +144,13 @@ class IntentionRefiner:
                 history_lines.append(f"Q: {q.question}")
                 history_lines.append(f"A: {a}")
 
+        history_lines.append(
+            "\n## IMPORTANT\n"
+            "You have received answers to your clarifying questions. You now have "
+            "sufficient information. Produce the final intention document (Format B). "
+            "Do NOT ask more questions."
+        )
+
         prompt = PROMPT_TEMPLATE_REFINE.format(
             raw_input=raw_input,
             history_section="\n".join(history_lines),
